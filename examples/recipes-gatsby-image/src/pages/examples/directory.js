@@ -42,10 +42,11 @@ export default () => {
 
   return (
     <Layout>
-      {images.map(image => (
+      {images.map((image, index) => (
         <Img
           fluid={image.node.childImageSharp.fluid}
           alt={image.node.base.split(`.`)[0]}
+          key={index}
         />
       ))}
     </Layout>

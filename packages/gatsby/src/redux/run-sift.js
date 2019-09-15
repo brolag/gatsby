@@ -1,10 +1,14 @@
-const sift = require(`sift`)
+const { default: sift } = require(`sift`)
 const _ = require(`lodash`)
 const prepareRegex = require(`../utils/prepare-regex`)
-const { resolveNodes, resolveRecursive } = require(`./prepare-nodes`)
 const { makeRe } = require(`micromatch`)
-const { getQueryFields } = require(`../db/common/query`)
 const { getValueAt } = require(`../utils/get-value-at`)
+const {
+  toDottedFields,
+  objectToDottedField,
+  liftResolvedFields,
+} = require(`../db/common/query`)
+const { getNodesAndResolvedNodes } = require(`./schema/node-mode.js`)
 
 /////////////////////////////////////////////////////////////////////
 // Parse filter
@@ -40,11 +44,11 @@ const getFilters = filters =>
 // Run Sift
 /////////////////////////////////////////////////////////////////////
 
-function isEqId(firstOnly, fieldsToSift, siftArgs) {
+function isEqId(firstOnly, siftArgs) {
   return (
     firstOnly &&
-    Object.keys(fieldsToSift).length === 1 &&
-    Object.keys(fieldsToSift)[0] === `id` &&
+    siftArgs.length > 0 &&
+    siftArgs[0].id &&
     Object.keys(siftArgs[0].id).length === 1 &&
     Object.keys(siftArgs[0].id)[0] === `$eq`
   )
@@ -53,11 +57,10 @@ function isEqId(firstOnly, fieldsToSift, siftArgs) {
 function handleFirst(siftArgs, nodes) {
   const index = _.isEmpty(siftArgs)
     ? 0
-    : sift.indexOf(
-        {
+    : nodes.findIndex(
+        sift({
           $and: siftArgs,
-        },
-        nodes
+        })
       )
 
   if (index !== -1) {
@@ -67,14 +70,13 @@ function handleFirst(siftArgs, nodes) {
   }
 }
 
-function handleMany(siftArgs, nodes, sort) {
+function handleMany(siftArgs, nodes, sort, resolvedFields) {
   let result = _.isEmpty(siftArgs)
     ? nodes
-    : sift(
-        {
+    : nodes.filter(
+        sift({
           $and: siftArgs,
-        },
-        nodes
+        })
       )
 
   if (!result || !result.length) return null
@@ -82,7 +84,20 @@ function handleMany(siftArgs, nodes, sort) {
   // Sort results.
   if (sort) {
     // create functions that return the item to compare on
-    const sortFields = sort.fields.map(field => v => getValueAt(v, field))
+    const dottedFields = objectToDottedField(resolvedFields)
+    const dottedFieldKeys = Object.keys(dottedFields)
+    const sortFields = sort.fields
+      .map(field => {
+        if (
+          dottedFields[field] ||
+          dottedFieldKeys.some(key => field.startsWith(key))
+        ) {
+          return `__gatsby_resolved.${field}`
+        } else {
+          return field
+        }
+      })
+      .map(field => v => getValueAt(v, field))
     const sortOrder = sort.order.map(order => order.toLowerCase())
 
     result = _.orderBy(result, sortFields, sortOrder)
@@ -104,20 +119,76 @@ function handleMany(siftArgs, nodes, sort) {
  *   if `firstOnly` is true
  */
 module.exports = args => {
-  const { getNode, getNodesByType } = require(`../db/nodes`)
+  const { getNode } = require(`../db/nodes`)
 
-  const { queryArgs, gqlType, firstOnly = false, nodeTypeNames } = args
+  const { nodeTypeNames } = args
 
-  // If nodes weren't provided, then load them from the DB
-  const nodes = args.nodes || getNodesByType(gqlType.name)
+  let nodes
 
-  const { filter, sort, group, distinct } = queryArgs
-  const siftFilter = getFilters(prepareQueryArgs(filter))
-  const fieldsToSift = getQueryFields({ filter, sort, group, distinct })
+  if (nodeTypeNames.length > 1) {
+    nodes = nodeTypeNames.reduce(
+      (acc, typeName) => acc.concat(getNodesAndResolvedNodes(typeName)),
+      []
+    )
+  } else {
+    nodes = getNodesAndResolvedNodes(nodeTypeNames[0])
+  }
+
+  return runSiftOnNodes(nodes, args, getNode)
+}
+
+/**
+ * Filters a list of nodes using mongodb-like syntax.
+ *
+ * @param args raw graphql query filter as an object
+ * @param nodes The nodes array to run sift over (Optional
+ *   will load itself if not present)
+ * @param type gqlType. Created in build-node-types
+ * @param firstOnly true if you want to return only the first result
+ *   found. This will return a collection of size 1. Not a single
+ *   element
+ * @returns Collection of results. Collection will be limited to size
+ *   if `firstOnly` is true
+ */
+const runSift = args => {
+  const { getNode, getNodesAndResolvedNodes } = require(`./nodes`)
+
+  const { nodeTypeNames } = args
+
+  let nodes
+
+  if (nodeTypeNames.length > 1) {
+    nodes = nodeTypeNames.reduce(
+      (acc, typeName) => acc.concat(getNodesAndResolvedNodes(typeName)),
+      []
+    )
+  } else {
+    nodes = getNodesAndResolvedNodes(nodeTypeNames[0])
+  }
+
+  return runSiftOnNodes(nodes, args, getNode)
+}
+
+exports.runSift = runSift
+
+const runSiftOnNodes = (nodes, args, getNode) => {
+  const {
+    queryArgs = { filter: {}, sort: {} },
+    firstOnly = false,
+    resolvedFields = {},
+    nodeTypeNames,
+  } = args
+
+  let siftFilter = getFilters(
+    liftResolvedFields(
+      toDottedFields(prepareQueryArgs(queryArgs.filter)),
+      resolvedFields
+    )
+  )
 
   // If the the query for single node only has a filter for an "id"
   // using "eq" operator, then we'll just grab that ID and return it.
-  if (isEqId(firstOnly, fieldsToSift, siftFilter)) {
+  if (isEqId(firstOnly, siftFilter)) {
     const node = getNode(siftFilter[0].id[`$eq`])
 
     if (
@@ -127,22 +198,14 @@ module.exports = args => {
       return []
     }
 
-    return resolveRecursive(node, fieldsToSift, gqlType.getFields()).then(
-      node => (node ? [node] : [])
-    )
+    return [node]
   }
 
-  return resolveNodes(
-    nodes,
-    gqlType.name,
-    firstOnly,
-    fieldsToSift,
-    gqlType.getFields()
-  ).then(resolvedNodes => {
-    if (firstOnly) {
-      return handleFirst(siftFilter, resolvedNodes)
-    } else {
-      return handleMany(siftFilter, resolvedNodes, queryArgs.sort)
-    }
-  })
+  if (firstOnly) {
+    return handleFirst(siftFilter, nodes)
+  } else {
+    return handleMany(siftFilter, nodes, queryArgs.sort, resolvedFields)
+  }
 }
+
+exports.runSiftOnNodes = runSiftOnNodes

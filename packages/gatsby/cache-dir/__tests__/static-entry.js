@@ -323,6 +323,7 @@ describe(`sanitizeComponents`, () => {
       <link
         rel="manifest"
         href="https://gatsbyjs.org/blog/manifest.webmanifest"
+        key={0}
       />,
     ])
     expect(sanitizedComponents[0].props.href).toBe(`/blog/manifest.webmanifest`)
